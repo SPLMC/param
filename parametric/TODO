@@ -1,0 +1,15 @@
+- stochastic weak bisimulation
+- collect special cases for analyses that is, cases where one would
+  divide by zero
+- improve DOT output
+- rewards
+  - expected instantaneous
+  - expected accumulated
+  (should both be simple, but must change lumping!)
+- limit state exploration for bounded until
+- method to set variables via command line
+  (avoid for example having several BRP models)
+- make switch for 'verbose' have an effect
+- MDP support
+  (bounded reachabiliy)
+- steady-state analyses

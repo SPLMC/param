@@ -1,0 +1,1039 @@
+%{
+/*
+ * This file is part of a parser for an extension of the PRISM language.
+ *
+ * This is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * The parser is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with the program this parser part of.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Copyright 2007-2010 Bjoern Wachter (Bjoern.Wachter@comlab.ox.ac.uk)
+ * Copyright 2009-2011 Ernst Moritz Hahn (emh@cs.uni-saarland.de)
+ */
+
+#include "Util.h"
+#include "AST.h"
+#include "PRISMParser.h"
+#include "Substitutor.h"
+
+using namespace prismparser_ast;
+using namespace boost;
+using namespace std;
+
+// function forward declarations
+extern int PRISMlex();
+void PRISMerror(const char *s);
+ 
+void PRISMerror(const std::string& s);
+
+namespace prismparser {
+  extern prismparser_ast::Substitution constants;
+  extern int line_number;
+}
+
+namespace prismparser {
+  int propmode = 0;
+  int line_number = 1;
+  Alternative* alternative = 0;
+  Command* command = 0;
+  Module* module = 0;
+  static unsigned rewStructNr = 0;
+
+  Substitution formulas;
+  
+  Exprs predicates;
+  Exprs properties;
+  Exprs invariants;
+  
+  Variables global_vars;
+  
+  shared_ptr<Expr> initial;
+  StateRewards state_rewards;
+  TransitionRewards transition_rewards;
+  RewNameToNr rewNameToNr;  
+  
+  
+  struct Subst {
+    Substitution expr_subst;
+    ActionSubstitution action_subst;
+    Subst() {}
+    Subst(Substitution& e, ActionSubstitution& a) : expr_subst(e), action_subst(a) {}
+    void clear() { expr_subst.clear(); action_subst.clear(); } 
+  } subst;
+
+  struct Instantiation {
+    std::string name;
+    std::string original;
+    Subst subst;
+    
+    Instantiation(const std::string& n, const std::string& o, const Subst& s) :
+      name(n), original(o), subst(s) {}
+  };
+
+  /*
+    Due to formula and const, we need to do delayed instantiation,
+    i.e. first read <<const>> and <<formula>> and then do the actual instantiation.
+  */
+  class ModuleManager {
+  public:
+    ModuleManager(Substitution& f, Substitution& c) : formulas(f), constants(c) {}
+    
+    void addModule(Module* m) {
+      assert(m);
+      boost::shared_ptr<Module> mptr(m);
+      modules.insert(std::pair<std::string,boost::shared_ptr<Module> >(m->name, mptr));
+    } 
+    
+    typedef std::vector<Instantiation> Instantiations;  
+    
+    void addInstantiation(const Instantiation& instantiation) {
+      instantiations.push_back(instantiation);
+    }
+    
+    void addModules(prismparser_ast::Model& model) {
+      // substitute formulas into original
+      apply(formulas,modules);
+                
+      // instantiate modules using original modules
+      instantiateModules(instantiations,modules);
+      // postcondition: the instantiated modules end up in modules
+                
+      // substitute constants into original and instantiated modules
+      apply(constants,modules);
+      // postcondition: result ends up in modules
+                
+      // put the modules into the model
+      for (Modules::const_iterator i (modules.begin ());
+           i != modules.end (); i++) {
+          model.addModule(i->second);
+        }
+    }
+
+    void clear() {
+      modules.clear();
+      instantiations.clear();
+    }
+
+  private:
+    Substitution& formulas;
+    Substitution& constants;
+    Instantiations instantiations;
+        
+    Module* instantiate(const Instantiation& inst) {
+        
+      // (1) lookup the module to substitute into
+      Modules::const_iterator it(modules.find(inst.original));
+      if (it == modules.end())
+        PRISMerror("Module "+ inst.original + " not found");
+                        
+      Module* instantiated_module(it->second.get());
+
+      // (2) invoke instantiation code with substition vector
+      std::string instance_module_name(inst.name);
+      Module* instance( 
+                       new Module(instance_module_name, 
+                                  instantiated_module, 
+                                  inst.subst.expr_subst,
+                                  inst.subst.action_subst));
+        
+      if(!instance) 
+        PRISMerror("Module "+ instance_module_name + " could not be created");
+      return instance;
+    }
+
+    void apply(const Substitution& s, Modules& modules) {
+      Modules new_modules;
+      for (Modules::const_iterator i (modules.begin ());
+           i != modules.end (); ++i)
+        {
+          std::string key(i->first);
+          boost::shared_ptr<Module> mptr(new Module(key,i->second.get(),s));
+          new_modules.insert(std::pair<std::string,boost::shared_ptr<Module> >(key, mptr));
+        }
+      modules = new_modules;
+    }
+        
+    void instantiateModules(const Instantiations& instantiations, Modules& modules) {
+      for(Instantiations::const_iterator it = instantiations.begin();it!=instantiations.end();++it) {
+        const Instantiation& inst(*it);
+        boost::shared_ptr<Module> mptr(instantiate(inst));
+        modules.insert(std::pair<std::string,boost::shared_ptr<Module> >(inst.name, mptr));
+      }
+    }
+
+        
+
+    Modules modules;
+  };
+
+  ModuleManager module_manager(formulas,constants);
+
+}
+
+
+#include "Util.h"
+using namespace prismparser; 
+
+%}
+
+%union {
+  prismparser_ast::Expr *node;
+  std::vector<prismparser_ast::Expr> *vec;
+
+  prismparser_ast::Alternative* a;
+  prismparser_ast::Type* type;
+  int int_const;
+  char *float_const;
+  char *string_const;
+  bool b;
+  
+  prismparser_ast::Expr* prop;
+
+  prismparser_ast::ModelType model_type;
+  prismparser_ast::Kind kind;
+};
+
+/* correspondence between lexer tokens and parser entities */
+%token BOGY
+%token LE_OP GE_OP EQ_OP NE_OP
+%token MIN_OP MAX_OP
+%token LEFT_OP RIGHT_OP
+%token TRUE FALSE
+%token INTEGER BOOL LONG FLOAT DOUBLE
+%token SHARP NEWLINE // line directives
+//temporal operators
+%token UNTIL NEXT
+%token PROB PROBMAX PROBMIN STEADY STEADYMAX STEADYMIN FINALLY CUMULATIVE
+
+%token MODULE
+%token ENDMODULE
+%token CONSTANT
+%token GLOBAL
+%token PARAM
+
+%token STOCH NONDET PROBAB
+
+%token PRIMED
+%token ASSIGN
+%token DISTR
+
+%token BLOCK
+%token VAR
+%token INIT
+%token ENDINIT
+%token INVAR
+%token ENDINVAR
+%token PRED
+%token DOTS
+%token LABEL
+%token QUOTE
+
+%token <int_const> INT_CONSTANT
+%token <float_const> FLOAT_CONSTANT
+%token <b> BOOL_CONSTANT;
+
+%token POW
+
+%token <string_const> IDENTIFIER 
+%token <node> FORMULA // syntactic substitution
+
+%type <node> numeric_constant
+%type <node> expression
+%type <node> propexpression
+%type <node> default_init opt_default_init
+
+%type <node> minmax;
+%type <node> opt_minmax;
+%type <node> steady_minmax;
+%type <node> rew_minmax;
+%type <node> opt_filter;
+
+%type <model_type> opt_model_type
+
+%token <string_const> STRING_LITERAL
+
+%token REWARDS ENDREWARDS
+%token REW REWMIN REWMAX
+%token I_REW
+
+%type <string_const> action
+
+%type <type> type
+
+
+%type <node> quant_minmax
+%type <node> pathproperty property bound
+
+%type <node> rew_struct
+
+// allows to use just one type of expression
+%left IMPL
+%left MIN_OP MAX_OP
+%left '?' ':'
+%left '|'
+%left '&'
+%left NE_OP '='
+%left '<' '>' LE_OP GE_OP 
+%left '+' '-'
+%left '*' '/' '%'
+%nonassoc '!'
+%nonassoc UPLUS
+%nonassoc UMINUS
+
+%start model
+%%
+
+numeric_constant
+      : INT_CONSTANT
+      {
+        $$ =  new Expr($1);
+      }
+      | FLOAT_CONSTANT
+      {
+        $$ = new Expr(Double, $1);
+	free($1);
+      }
+      ;
+
+expression
+      : numeric_constant
+      | TRUE {
+          $$ = new Expr(true);
+      }
+      | FALSE {
+          $$ = new Expr(false);
+      }
+      | IDENTIFIER {
+         $$ = new Expr(Var, $1);
+         free($1);
+      }
+      | expression '=' expression {
+                $$ = new Expr(Eq, $1, $3);
+      }
+      | expression NE_OP expression {
+                $$ = new Expr(Neq, $1, $3);
+      }
+      | '+' expression %prec UPLUS
+      { 
+          $$ = $2;
+      }
+      | '-' expression %prec UMINUS
+      {
+                $$ = new Expr(Uminus, $2);
+      }
+      | expression '+' expression {
+                $$ = new Expr(Plus, $1, $3);
+      }
+      | expression '-' expression {
+                $$ = new Expr(Minus, $1, $3);
+      }
+      | expression '*' expression {
+                $$ = new Expr(Mult, $1, $3);
+      }
+      | expression '/' expression {
+                $$ = new Expr(Div, $1, $3);
+      }
+      | POW '(' expression ',' expression ')' {
+        $$ = new Expr(Pow, $3, $5);
+      }
+      | expression '<' expression {
+                $$ = new Expr(Lt, $1, $3);
+      }
+      | expression '>' expression {
+                $$ = new Expr(Gt, $1, $3);
+      }
+      | expression LE_OP expression {
+                $$ = new Expr(Le, $1, $3);
+      }
+      | expression GE_OP expression {
+                $$ = new Expr(Ge, $1, $3);
+      }
+      | MAX_OP '(' expression ',' expression ')' {
+                $$ = new Expr(Max, $3, $5);
+      }
+      | MIN_OP '(' expression ',' expression ')' {
+                $$ = new Expr(Min, $3, $5);
+      }
+      | '!' expression %prec '!'
+      {
+                $$ = new Expr(Not, $2);
+      }
+      | expression '&' expression {
+                $$ = new Expr(And, $1, $3);
+      }
+      | expression '|' expression {
+                $$ = new Expr(Or, $1, $3);
+      }
+      | expression IMPL expression {
+                $$ = new Expr(Impl, $1, $3);
+      }
+      | expression '?' expression ':' expression { 
+                $$ = new Expr(Ite, $1, $3, $5);
+      }
+      | '(' expression ')' {
+                $$ = $2;
+      }
+      | QUOTE INIT QUOTE {
+      	    	 $$ = new Expr(Var, "init");
+      }
+      ;
+
+propexpression
+      : numeric_constant
+      | TRUE {
+          $$ = new Expr(true);
+      }
+      | FALSE {
+          $$ = new Expr(false);
+      }
+      | IDENTIFIER {
+         $$ = new Expr(Var, $1);
+         free($1);
+      }
+      | propexpression '=' propexpression {
+                $$ = new Expr(Eq, $1, $3);
+      }
+      | propexpression NE_OP propexpression {
+                $$ = new Expr(Neq, $1, $3);
+      }
+      | '+' propexpression %prec UPLUS
+      { 
+          $$ = $2;
+      }
+      | '-' propexpression %prec UMINUS
+      {
+                $$ = new Expr(Uminus, $2);
+      }
+      | propexpression '+' propexpression {
+                $$ = new Expr(Plus, $1, $3);
+      }
+      | propexpression '-' propexpression {
+                $$ = new Expr(Minus, $1, $3);
+      }
+      | propexpression '*' propexpression {
+                $$ = new Expr(Mult, $1, $3);
+      }
+      | propexpression '/' propexpression {
+                $$ = new Expr(Div, $1, $3);
+      }
+      | propexpression '<' propexpression {
+                $$ = new Expr(Lt, $1, $3);
+      }
+      | propexpression '>' propexpression {
+                $$ = new Expr(Gt, $1, $3);
+      }
+      | propexpression LE_OP propexpression {
+                $$ = new Expr(Le, $1, $3);
+      }
+      | propexpression GE_OP propexpression {
+                $$ = new Expr(Ge, $1, $3);
+      }
+      | MAX_OP '(' propexpression ',' propexpression ')' {
+                $$ = new Expr(Max, $3, $5);
+      }
+      | MIN_OP '(' propexpression ',' propexpression ')' {
+                $$ = new Expr(Min, $3, $5);
+      }
+      | '!' propexpression %prec '!'
+      {
+                $$ = new Expr(Not,$2);
+      }
+      | propexpression '&' propexpression {
+                $$ = new Expr(And, $1, $3);
+      }
+      | propexpression '|' propexpression {
+                $$ = new Expr(Or, $1, $3);
+      }
+      | propexpression IMPL propexpression {
+                $$ = new Expr(Impl, $1, $3);
+      }
+      | propexpression '?' propexpression ':' propexpression { 
+                $$ = new Expr(Ite, $1, $3, $5);
+      }
+      | '(' propexpression ')' {
+                $$ = $2;
+      }
+      | QUOTE IDENTIFIER QUOTE {
+                $$ = new Expr(Var, $2);
+                free($2);
+      }
+      | QUOTE INIT QUOTE {
+      	    	 $$ = new Expr(Var, "init");
+      }
+      | property
+      ;
+
+single_assignment
+      : '(' expression PRIMED '=' expression ')'
+      {
+        assert(alternative);
+        alternative->update.Assign($2,$5);
+      }
+      ;
+
+single_assignments
+      : single_assignments '&' single_assignment
+      | single_assignment
+      ;
+
+update
+      : single_assignments
+      | TRUE 
+      ;
+
+prob_assignment
+      : expression ':' update
+      {                 
+        assert(alternative);
+        alternative->setWeight($1);
+      }
+      ;
+
+prob_assignment_list
+      : prob_assignment
+        {
+          assert(command);
+        }
+      | prob_assignment '+'
+        {
+          assert(command);
+          alternative = new Alternative();
+          command->addAlternative(alternative);
+        }
+        prob_assignment_list
+      ;
+
+distribution
+      : DISTR update {
+        alternative->setWeight(new Expr(Double, "1"));
+      }
+      | DISTR prob_assignment_list
+      ;
+
+action
+        : '[' ']' { $$ = 0; }
+        | '[' IDENTIFIER ']' { $$ = $2; }
+
+command
+      : action
+      {
+        std::string action($1 ? $1 : "");
+        if ($1) {
+          free($1);
+        }
+        command = new Command(action);
+        assert(module); 
+        module->addCommand(command);
+        if(action!="") PRISMParser::astModel.actions.insert(action);
+      } 
+      expression
+      {
+        alternative = new Alternative();
+        command->addAlternative(alternative);
+      }
+      distribution ';'
+      {
+        assert(command);
+        command->setGuard($3);
+      }
+      ;
+
+command_list
+      : 
+      | command_list command
+      ;
+
+init
+  : INIT expression ENDINIT
+  {
+    assert($2);
+    shared_ptr<Expr> eptr(new Expr($2, constants));
+    delete $2;
+    initial = eptr ;
+  }
+  ;
+
+trans
+  : command_list
+  ;
+
+
+opt_type
+  : 
+  | type { delete $1; }
+  ;
+
+default_init 
+  : INIT expression
+  { $$ = $2; }
+
+opt_default_init
+  : 
+  { $$ = 0; }
+  | default_init
+  ;
+
+type
+  : INTEGER
+    { $$ = new Type(1); }
+  | FLOAT 
+    { $$ = new Type(1.0); }
+  | DOUBLE
+    { $$ = new Type(1.0); }
+  | BOOL
+    { $$ = new Type(true); }
+  |'[' expression DOTS expression ']'
+    { $$ = new Type($2,$4); }
+  ;
+
+global_var_decl
+  : 
+  GLOBAL IDENTIFIER ':' type opt_default_init ';'
+  {
+        std::string name ($2);
+        free($2);
+
+        Variable* vptr(new Variable(name,$4,$5));
+        global_vars.insert(std::pair<std::string, boost::shared_ptr<Variable> > (name, shared_ptr<Variable> (vptr) ));
+  } 
+  ;
+
+var_decl
+  : 
+  IDENTIFIER ':' type opt_default_init ';'
+  {
+        std::string name($1);
+        free($1);
+
+        Variable* vptr(new Variable(name,$3,$4));
+        if (!module) {
+                yyerror("Global variable \"" + name + "\" must be declared \"global\"\n");
+        }
+        module->addVariable(vptr);
+  } 
+  ;
+
+const_decl
+ : CONSTANT opt_type IDENTIFIER '=' expression ';'
+  {
+        assert($5);
+        assert($3);
+        shared_ptr<Expr> se($5);
+
+        constants.insert(std::pair<std::string, boost::shared_ptr<Expr> > ($3 , se));
+        free($3);
+  }
+  | PARAM type IDENTIFIER ';'
+  {
+        Variable* vptr (new Variable($3,$2));
+        vptr->is_parameter = true;
+        free($3);
+        PRISMParser::astModel.addVariable(vptr);
+  }
+  | PARAM IDENTIFIER ':' type ';'
+  {
+        Variable* vptr (new Variable($2,$4));
+        vptr->is_parameter = true;
+        free($2);
+        PRISMParser::astModel.addVariable(vptr);
+  }
+  | FORMULA IDENTIFIER '=' expression ';'
+  {
+        assert($2);
+        assert($4);
+        shared_ptr<Expr> eptr($4);
+        formulas.insert(std::pair<std::string, boost::shared_ptr<Expr> > ($2,eptr)) ;
+        free($2);
+  }
+  ;
+  
+var_decl_list
+  : 
+  | var_decl_list var_decl
+  ;
+
+pred
+   : PRED pred_list ';'
+   ;
+
+pred_list
+   : predicate
+   | pred_list ',' predicate
+   ;
+
+predicate
+        : expression
+        { 
+                shared_ptr<Expr> eptr($1);
+                predicates.push_back( eptr );
+        }
+        
+
+subst
+    : IDENTIFIER '=' expression { // action label
+            assert($3);
+            shared_ptr<Expr> eptr($3);
+                subst.expr_subst[$1] = eptr;
+                
+                std::string original_action($1);
+        free($1);
+                if (PRISMParser::astModel.actions.count(original_action) > 0) {
+                        std::string action_name($3->getIdentifier());
+                        subst.action_subst[original_action] = action_name;
+                        PRISMParser::astModel.actions.insert(action_name);
+                }        
+        }
+        ;
+
+
+// this rule adds entries to the lhs and rhs vectors
+subst_list 
+       : subst_list ',' subst
+       | subst
+       ;
+
+module
+  : // declare new module
+  MODULE IDENTIFIER
+  {
+        module = new Module($2);
+        module_manager.addModule(module);
+        free($2);
+  }
+  var_decl_list trans ENDMODULE
+  {
+        module = 0;
+  }
+  | // declare new module by instantiating existing one
+  MODULE IDENTIFIER '=' IDENTIFIER { 
+        // initialize the subst_list vector
+        subst.clear();
+  } '[' subst_list ']' {
+        // (1) lookup the module to substitute into
+        std::string module_name ($2);
+        free($2);
+        std::string instantiated_module_name ($4);
+        free($4);
+
+        // schedule instantiation
+        Instantiation inst (module_name,instantiated_module_name,subst); 
+
+        module_manager.addInstantiation(inst);        
+
+          }
+  ENDMODULE
+  ;
+  
+rewards
+  : REWARDS rewardlist { rewStructNr++; } ENDREWARDS
+  | REWARDS QUOTE IDENTIFIER QUOTE { rewNameToNr.insert(make_pair($3, rewStructNr)); }  rewardlist { rewStructNr++; } ENDREWARDS
+  ;
+
+rewardlist
+  : reward
+  | rewardlist reward
+  ;
+
+reward
+  : expression ':' expression ';'
+    {
+      shared_ptr<Expr> eptr1($1), eptr2($3);
+      state_rewards.push_back(StateReward(rewStructNr, eptr1, eptr2));
+    }
+    | '[' ']' expression ':' expression ';'
+    {
+      shared_ptr<Expr> eptr1($3), eptr2($5);
+      PRISMParser::astModel.transition_rewards.push_back(make_tuple(rewStructNr, "", eptr1, eptr2));
+    }
+    | '[' IDENTIFIER ']' expression ':' expression ';'
+    {
+      std::string label($2);
+      shared_ptr<Expr> eptr1($4), eptr2($6);
+      transition_rewards.push_back(TransitionReward(rewStructNr, label, eptr1, eptr2));
+      free($2);
+    }
+  ;
+
+invariant
+  : INVAR expression ';'
+  { 
+          shared_ptr<Expr> iptr($2);
+    invariants.push_back(iptr);
+  }
+  ;
+
+opt_model_type
+  : { $$ = Unspecified; }
+  | PROBAB { $$ = DTMC; }
+  | STOCH  { $$ = CTMC; }
+  | NONDET { $$ = MDP; }
+  ;
+
+decl
+  : global_var_decl
+  | const_decl
+  | module
+  | init
+  | rewards
+  | invariant
+  | pred
+  | {propmode = 1; } prop '\n' {propmode = 0;}
+  ;
+
+decl_list
+  : decl_list decl
+  | decl
+  ;
+
+model
+  :   opt_model_type decl_list {
+        if (Unspecified != $1) {
+          PRISMParser::astModel.model_type = $1;
+        }
+
+	Substitutor(constants, formulas);
+
+        for (Variables::const_iterator i = global_vars.begin(); i!= global_vars.end(); ++i) {
+                shared_ptr<Variable> vptr(i->second);
+                PRISMParser::astModel.addVariable(new Variable(vptr.get(),constants));
+        }
+
+        module_manager.addModules(PRISMParser::astModel);
+        module_manager.clear();        
+
+        for (Exprs::const_iterator i=predicates.begin();i!=predicates.end();++i) {
+                shared_ptr<Expr> eptr(new Expr(i->get(), constants));
+                PRISMParser::astModel.predicates.push_back(eptr);
+        }
+        predicates.clear();
+        
+        for (Exprs::const_iterator i=invariants.begin();i!=invariants.end();++i) {
+                shared_ptr<Expr> eptr(new Expr(i->get(),constants));
+                PRISMParser::astModel.invariants.push_back(eptr);
+        }
+        invariants.clear();
+        
+        // rewards
+        for (StateRewards::const_iterator i = state_rewards.begin(); i != state_rewards.end(); i++) {
+                StateReward sr(i->get<0>(), shared_ptr<Expr>(new Expr(i->get<1>().get(), constants)),
+                               shared_ptr<Expr>(new Expr(i->get<2>().get(), constants)));
+                
+                PRISMParser::astModel.state_rewards.push_back(sr);
+        }
+        state_rewards.clear();
+
+        for(TransitionRewards::const_iterator i=transition_rewards.begin();i!=transition_rewards.end();++i) {
+                TransitionReward tr(i->get<0>(), i->get<1>(),
+		shared_ptr<Expr>(new Expr(i->get<2>().get(), constants)),
+		shared_ptr<Expr>(new Expr(i->get<3>().get(), constants)));
+                
+                PRISMParser::astModel.transition_rewards.push_back(tr);
+        }
+        transition_rewards.clear();
+        
+        if(initial.get())
+        PRISMParser::astModel.setInitial(new Expr(initial.get(), constants));
+        
+
+        Substitution subst;
+        
+
+          for (Exprs::const_iterator i=properties.begin();i!=properties.end();++i) {
+                PRISMParser::astModel.properties.push_back(shared_ptr<Expr>(new Expr(i->get(), formulas)));
+        }
+        properties.clear();
+  }
+  ;
+
+// properties
+
+label 
+  : LABEL QUOTE IDENTIFIER QUOTE '=' expression ';'
+  {
+          assert($3);
+          assert($6);
+        boost::shared_ptr<Expr> eptr($6);
+        formulas.insert(std::pair<std::string, boost::shared_ptr<Expr> >($3,eptr));
+        free($3);
+  }
+  ;
+
+
+
+quant_minmax
+  : PROBMAX { $$ = new Expr(1); }
+  | PROBMIN { $$ = new Expr(-1); }
+  | PROB    { $$ = new Expr(0); }
+  ;
+
+prop
+  : propexpression {
+                  shared_ptr<Expr> pptr(new Expr($1,constants));
+        delete $1;
+                properties.push_back(pptr);
+    }
+   | label
+    ;
+
+bound
+  : GE_OP propexpression {
+        $$ = new Expr(Ge, new Expr(Var, "p"), $2);
+  }
+  | '>'  propexpression {
+        $$ = new Expr(Gt, new Expr(Var, "p"), $2);
+  }
+  | LE_OP propexpression {
+        $$ = new Expr(Le, new Expr(Var, "p"), $2);
+  }
+  | '<'  propexpression {
+        $$ = new Expr(Lt, new Expr(Var, "p"), $2);
+  }
+  | '=' '?' {
+        $$ = new Expr(true);
+  }
+  | '=' propexpression {
+        $$ = new Expr(Eq, new Expr(Var, "p"), $2);
+  }
+  ;
+
+rew_struct
+  : '{' QUOTE IDENTIFIER QUOTE '}' {
+        $$ = new Expr(Var, $3);
+        free($3);
+      }
+  | '{' numeric_constant '}' {
+        $$ = new Expr($2);
+      }
+  ;
+
+opt_minmax
+  : { $$ = new Expr(0); }
+  | MIN_OP { $$ = new Expr(-1); }
+  | MAX_OP { $$ = new Expr(1); }
+  ;
+
+minmax
+  : MIN_OP { $$ = new Expr(-1); }
+  | MAX_OP { $$ = new Expr(1); }
+  ;
+
+steady_minmax
+  : STEADY { $$ = new Expr(0); }
+  | STEADYMIN { $$ = new Expr(-1); }
+  | STEADYMAX { $$ = new Expr(1); }
+  ;
+
+rew_minmax
+  : REW { $$ = new Expr(0); }
+  | REWMIN { $$ = new Expr(-1); }
+  | REWMAX { $$ = new Expr(1); }
+  ;
+
+opt_filter
+  : { $$ = new Expr(Filter, new Expr(Var, "init"), new Expr(0)); }
+  | '{' propexpression '}' { $$ = new Expr(Filter, $2, new Expr(0)); }
+  | '{' minmax '}' { $$ = new Expr(Filter, new Expr(Var, "init"), $2); }
+  | '{' propexpression '}' '{' minmax '}' { $$ = new Expr(Filter, $2, $5); }
+
+property 
+  : quant_minmax bound '[' pathproperty opt_filter ']' {
+        $$ = new Expr(P, $1, $2, $4, new Expr(0), $5);
+  }
+  | steady_minmax bound '[' propexpression opt_filter ']' {
+        $$ = new Expr(Steady, $1, $2, $4, NULL, $5);
+  }
+  | REW rew_struct opt_minmax bound '[' FINALLY propexpression opt_filter ']' {
+        $$ = new Expr(ReachabilityReward, $3, $4, $7, $2, $8);
+  }
+  | rew_minmax bound '[' FINALLY propexpression opt_filter ']' {
+        $$ = new Expr(ReachabilityReward, $1, $2, $5, new Expr(1), $6);
+  }
+  | REW rew_struct opt_minmax bound '[' CUMULATIVE LE_OP numeric_constant opt_filter ']' {
+        $$ = new Expr(CumulativeReward, $3, $4, $8, $2, $9);
+  }
+  | rew_minmax bound '[' CUMULATIVE LE_OP numeric_constant opt_filter ']' {
+        $$ = new Expr(CumulativeReward, $1, $2, $6, new Expr(1), $7);
+  }
+  | REW rew_struct opt_minmax bound '[' I_REW '=' numeric_constant opt_filter ']' {
+        $$ = new Expr(InstantaneousReward, $3, $4, $8, $2, $9);
+  }
+  | rew_minmax bound '[' I_REW '=' numeric_constant opt_filter ']' {
+        $$ = new Expr(InstantaneousReward, $1, $2, $6, new Expr(1), $7);
+  }
+  | REW rew_struct opt_minmax bound '[' STEADY opt_filter ']' {
+          $$ = new Expr(SteadyStateReward, $3, $4, new Expr(0), $2, $7);
+  }
+  | rew_minmax bound '[' STEADY opt_filter ']' {
+          $$ = new Expr(SteadyStateReward, $1, $2, new Expr(0), new Expr(1), $5);
+  }
+  ;
+
+pathproperty
+  : propexpression UNTIL GE_OP numeric_constant propexpression {
+        $$ = new Expr(Until, $1, $5, $4, new Expr());
+  }
+  | propexpression UNTIL LE_OP numeric_constant propexpression {
+        $$ = new Expr(Until, $1, $5, new Expr(), $4);
+  }
+  | propexpression UNTIL '[' numeric_constant ',' numeric_constant ']' propexpression {
+        $$ = new Expr(Until, $1, $8, $4, $6);
+  }
+  | propexpression UNTIL propexpression {
+        $$ = new Expr(Until, $1, $3);
+  }
+  | FINALLY GE_OP numeric_constant propexpression {
+        $$ = new Expr(Until, new Expr(true), $4, $3, new Expr());
+  }
+  | FINALLY LE_OP numeric_constant propexpression {
+        $$ = new Expr(Until, new Expr(true), $4, new Expr(), $3);
+  }
+  | FINALLY '[' numeric_constant ',' numeric_constant ']' propexpression {
+        $$ = new Expr(Until, new Expr(true), $7, $3, $5);
+  }
+  | FINALLY propexpression {
+          $$ = new Expr(Until, new Expr(true), $2);
+  }
+  | NEXT propexpression {
+        $$ = new Expr(Next, $2);
+  }
+  | NEXT GE_OP numeric_constant propexpression {
+        $$ = new Expr(Next,$4, $3, new Expr());
+  }
+  | NEXT LE_OP numeric_constant propexpression {
+        $$ = new Expr(Next,$4, new Expr(),$3);
+  }
+  | NEXT '[' numeric_constant ',' numeric_constant ']' propexpression {
+        $$ = new Expr(Next,$7, $3, $5);
+  }
+  ;
+
+%%
+
+extern char PRISMtext[];
+//extern int PRISM::line_number;
+extern std::string file_name;
+extern int column;
+
+void PRISMerror(const char *s)
+{
+  throw prismparser::prismparser_error("PRISMParser: file: "+ file_name + " @line "+prismparser::intToString(line_number) + " " + s);
+}
+
+
+void PRISMerror(char *s)
+{
+  throw prismparser::prismparser_error("PRISMParser: file: "+ file_name + " @line "+prismparser::intToString(line_number) + " " + s);
+}
+
+void PRISMerror(const std::string& s) {
+  throw prismparser::prismparser_error("PRISMParser: file: "+ file_name + " @line "+prismparser::intToString(line_number) + " " + s);
+}
