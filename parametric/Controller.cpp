@@ -224,7 +224,8 @@ namespace parametric {
     statistics->exploreTime.start();
     ModelExplorer *explorer;
     if (0 == vm->count("low-level-input")) {
-      explorer = new Model2XExplorer();
+      bool fixDeadlocks = 0 != vm->count("fix-deadlocks");
+      explorer = new Model2XExplorer(fixDeadlocks);
     } else {
       explorer = new LowLevelExplorer();
     }

@@ -39,7 +39,8 @@ namespace parametric {
   using namespace model2x;
   using namespace rational;
   
-  Model2XExplorer::Model2XExplorer() {
+  Model2XExplorer::Model2XExplorer(bool fixDeadlocks)
+      :fixDeadlocks(fixDeadlocks) {
     model = new Model();
   }
   
@@ -58,7 +59,9 @@ namespace parametric {
     p.run(model_filename, *model);
     fclose(stdin);
     model->flatten();
-    model->fixDeadlocks();
+    if (fixDeadlocks) {
+      model->fixDeadlocks();
+    }
     p.run(property_filename, *model);
     fclose(stdin);
     *props = model->getProperties();

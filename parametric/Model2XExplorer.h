@@ -41,7 +41,7 @@ namespace parametric {
   
   class Model2XExplorer : public ModelExplorer {
   public:
-    Model2XExplorer();
+    Model2XExplorer(bool fixDeadlocks);
     virtual ~Model2XExplorer();
     void explore();
   private:
@@ -55,6 +55,7 @@ namespace parametric {
     prismparser::Model *model;
     bool useReward;
     unsigned rewardStruct;
+    bool fixDeadlocks;
   };
 }
 

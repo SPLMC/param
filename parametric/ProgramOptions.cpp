@@ -107,6 +107,7 @@ namespace parametric {
     visible->add_options()
       ("help", "produce help message")
       ("low-level-input", "use low-level input format")
+      ("fix-deadlocks", "fix deadlocks by synthesizing a command whose guard is disjoint to all others")
       ;
     
     visible->add(bisimulation);
