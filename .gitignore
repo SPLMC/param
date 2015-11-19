@@ -1,3 +1,19 @@
+# Executable
+param
+
+# Debug Lua Script
+*.lua
+
+# Automatically generated files
+Makefile.dep
+*.tab.hpp
+*.tab.cpp
+*.yy.cpp
+
+# Run by-products
+regions.tex
+states
+
 # Compiled Object files
 *.slo
 *.lo
